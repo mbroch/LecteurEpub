@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecteur EPUB</title>
+
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    font: 15px system-ui, sans-serif;
+    color: #25231f;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 9px 14px;
+    background: #f4f1e9;
+    border-bottom: 1px solid #ddd;
+  }
+
+  #titre {
+    flex: 1 1 150px;
+    min-width: 120px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  button, .fichier {
+    padding: 7px 12px;
+    border: 1px solid #aaa;
+    border-radius: 6px;
+    background: white;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  button:disabled { opacity: 0.5; cursor: default; }
+  #choix { display: none; }
+
+  #etat {
+    min-width: 140px;
+    text-align: center;
+    font-size: 0.9rem;
+    white-space: nowrap;
+  }
+
+  #position {
+    width: clamp(110px, 20vw, 240px);
+    cursor: pointer;
+  }
+
+  #taille { width: 90px; }
+
+  iframe {
+    display: block;
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    border: 0;
+  }
+
+  @media (max-width: 560px) {
+    header { gap: 7px; padding: 8px; }
+    #etat { min-width: 105px; font-size: 0.8rem; }
+    #position { width: 115px; }
+    #taille { width: 70px; }
+    button, .fichier { padding: 7px 9px; }
+  }
+</style>
+</head>
+
+<body>
+<header>
+  <label class="fichier" for="choix">Ouvrir un EPUB</label>
+  <input id="choix" type="file" accept=".epub,application/epub+zip">
+
+  <strong id="titre">Aucun livre ouvert</strong>
+
+  <button id="prec" disabled aria-label="Défiler vers le haut">↑</button>
+  <span id="etat">Choisis un fichier</span>
+  <button id="suiv" disabled aria-label="Défiler vers le bas">↓</button>
+
+  <label for="position">Position</label>
+  <input id="position" type="range" min="0" max="10000" value="0"
+         aria-label="Position dans le livre">
+
+  <label for="taille">Texte</label>
+  <input id="taille" type="range" min="80" max="160" value="100"
+         aria-label="Taille du texte">
+</header>
+
+<iframe id="page" sandbox="allow-same-origin" title="Texte du livre"></iframe>
+
+<script>
+"use strict";
+
+const choix = document.querySelector("#choix");
+const frame = document.querySelector("#page");
+const titre = document.querySelector("#titre");
+const etat = document.querySelector("#etat");
+const prec = document.querySelector("#prec");
+const suiv = document.querySelector("#suiv");
+const position = document.querySelector("#position");
+const taille = document.querySelector("#taille");
+
+let anciennesURLs = [];
+
+function normaliser(chemin) {
+  const morceaux = chemin.replace(/\\/g, "/").split("/");
+  const resultat = [];
+
+  for (const morceau of morceaux) {
+    if (!morceau || morceau === ".") continue;
+    if (morceau === "..") resultat.pop();
+    else resultat.push(morceau);
+  }
+
+  return resultat.join("/");
+}
+
+function resoudre(ref, fichierDeBase) {
+  try {
+    const url = new URL(ref, "https://epub.invalid/" + fichierDeBase);
+    return decodeURIComponent(url.pathname.slice(1));
+  } catch {
+    return normaliser(ref.split("#")[0].split("?")[0]);
+  }
+}
+
+function texteXML(bytes) {
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function parserXML(texte) {
+  const doc = new DOMParser().parseFromString(texte, "application/xml");
+
+  if (doc.querySelector("parsererror")) {
+    throw new Error("Un fichier XML de l’EPUB est invalide.");
+  }
+
+  return doc;
+}
+
+function mime(chemin) {
+  const ext = chemin.split(".").pop().toLowerCase();
+
+  return ({
+    xhtml: "application/xhtml+xml",
+    html: "text/html",
+    css: "text/css",
+    xml: "application/xml",
+    ncx: "application/xml",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    svg: "image/svg+xml",
+    webp: "image/webp",
+    woff: "font/woff",
+    woff2: "font/woff2",
+    otf: "font/otf",
+    ttf: "font/ttf",
+    mp3: "audio/mpeg",
+    mp4: "video/mp4"
+  })[ext] || "application/octet-stream";
+}
+
+/* Décompresse les entrées ZIP avec les méthodes courantes 0 et 8. */
+async function ouvrirZIP(buffer) {
+  const vue = new DataView(buffer);
+  const debutRecherche = Math.max(0, buffer.byteLength - 65557);
+  let fin = -1;
+
+  for (let i = buffer.byteLength - 22; i >= debutRecherche; i--) {
+    if (vue.getUint32(i, true) === 0x06054b50) {
+      fin = i;
+      break;
+    }
+  }
+
+  if (fin < 0) {
+    throw new Error("Fin de l’archive ZIP introuvable.");
+  }
+
+  const nombre = vue.getUint16(fin + 10, true);
+  let positionZIP = vue.getUint32(fin + 16, true);
+  const fichiers = new Map();
+
+  for (let i = 0; i < nombre; i++) {
+    if (vue.getUint32(positionZIP, true) !== 0x02014b50) {
+      throw new Error("Structure ZIP inattendue.");
+    }
+
+    const flags = vue.getUint16(positionZIP + 8, true);
+    const methode = vue.getUint16(positionZIP + 10, true);
+    const tailleComp = vue.getUint32(positionZIP + 20, true);
+    const longueurNom = vue.getUint16(positionZIP + 28, true);
+    const longueurExtra = vue.getUint16(positionZIP + 30, true);
+    const longueurCommentaire = vue.getUint16(positionZIP + 32, true);
+    const decalageLocal = vue.getUint32(positionZIP + 42, true);
+
+    const nomBytes = new Uint8Array(buffer, positionZIP + 46, longueurNom);
+    const nom = normaliser(new TextDecoder("utf-8").decode(nomBytes));
+
+    positionZIP += 46 + longueurNom + longueurExtra + longueurCommentaire;
+
+    if (!nom || nom.endsWith("/")) continue;
+    if (flags & 1) throw new Error("Cet EPUB semble chiffré.");
+
+    if (methode !== 0 && methode !== 8) {
+      throw new Error(`Méthode ZIP non prise en charge : ${methode}`);
+    }
+
+    const longueurNomLocal = vue.getUint16(decalageLocal + 26, true);
+    const longueurExtraLocal = vue.getUint16(decalageLocal + 28, true);
+    const debutContenu = decalageLocal + 30 + longueurNomLocal + longueurExtraLocal;
+    const compresse = buffer.slice(debutContenu, debutContenu + tailleComp);
+
+    let contenu;
+
+    if (methode === 0) {
+      contenu = new Uint8Array(compresse);
+    } else {
+      if (!("DecompressionStream" in window)) {
+        throw new Error(
+          "Ce navigateur ne prend pas en charge la décompression ZIP nécessaire."
+        );
+      }
+
+      const flux = new Blob([compresse])
+        .stream()
+        .pipeThrough(new DecompressionStream("deflate-raw"));
+
+      contenu = new Uint8Array(await new Response(flux).arrayBuffer());
+    }
+
+    fichiers.set(nom, contenu);
+  }
+
+  return fichiers;
+}
+
+function urlRessource(ref, fichierDeBase, urls) {
+  const valeur = ref.trim();
+
+  if (
+    !valeur ||
+    /^(#|data:|https?:|mailto:|tel:|\/\/|blob:|javascript:)/i.test(valeur)
+  ) {
+    return valeur;
+  }
+
+  const chemin = resoudre(valeur.split("#")[0].split("?")[0], fichierDeBase);
+  return urls.get(chemin) || valeur;
+}
+
+function adapterCSS(css, chemin, urls) {
+  return css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, guillemet, ref) => {
+    const adresse = urlRessource(ref, chemin, urls);
+    return `url("${adresse.replace(/"/g, "%22")}")`;
+  });
+}
+
+function adapterDocument(doc, chemin, urls, cheminsChapitres) {
+  Array.from(doc.querySelectorAll("script, iframe, object, embed"))
+    .forEach(element => element.remove());
+
+  Array.from(doc.querySelectorAll("*")).forEach(element => {
+    Array.from(element.attributes).forEach(attr => {
+      if (/^on/i.test(attr.name)) {
+        element.removeAttribute(attr.name);
+        return;
+      }
+
+      if (attr.name === "style") {
+        element.setAttribute(
+          "style",
+          adapterCSS(attr.value, chemin, urls)
+        );
+      }
+
+      if (!["src", "poster", "href"].includes(attr.name)) return;
+
+      const ref = attr.value.trim();
+
+      if (
+        !ref ||
+        ref.startsWith("#") ||
+        /^(https?:|mailto:|tel:|data:|\/\/|blob:|javascript:)/i.test(ref)
+      ) {
+        return;
+      }
+
+      const morceaux = ref.split("#");
+      const cible = morceaux[0];
+      const fragment = morceaux[1] || "";
+      const cheminCible = resoudre(cible, chemin);
+
+      if (element.localName === "a" && cheminsChapitres.has(cheminCible)) {
+        const idChapitre = cheminsChapitres.get(cheminCible);
+        element.setAttribute(
+          "href",
+          `#${idChapitre}${fragment ? "-" + fragment : ""}`
+        );
+      } else if (urls.has(cheminCible)) {
+        element.setAttribute(
+          attr.name,
+          urls.get(cheminCible) + (fragment ? "#" + fragment : "")
+        );
+      }
+    });
+  });
+}
+
+function actualiserProgression() {
+  try {
+    const doc = frame.contentDocument;
+    if (!doc) return;
+
+    const defilable = doc.scrollingElement || doc.documentElement;
+    const hauteurVue = frame.clientHeight;
+    const hauteurTotale = defilable.scrollHeight;
+    const maxDefilement = Math.max(0, hauteurTotale - hauteurVue);
+    const haut = Math.max(0, Math.min(defilable.scrollTop, maxDefilement));
+
+    const totalEcrans = Math.max(1, Math.ceil(hauteurTotale / hauteurVue));
+    const ecranCourant = Math.min(
+      totalEcrans,
+      Math.floor(haut / hauteurVue) + 1
+    );
+
+    const pct = maxDefilement > 0 ? Math.round((haut / maxDefilement) * 100) : 0;
+
+    etat.textContent = `Écran ${ecranCourant} / ${totalEcrans} · ${pct} %`;
+    position.value = String(Math.round((haut / (maxDefilement || 1)) * 10000));
+  } catch (erreur) {
+    console.warn("Mise à jour de la progression impossible.", erreur);
+  }
+}
+
+choix.addEventListener("change", async () => {
+  const fichier = choix.files[0];
+  if (!fichier) return;
+
+  anciennesURLs.forEach(url => URL.revokeObjectURL(url));
+  anciennesURLs = [];
+
+  titre.textContent = fichier.name;
+  etat.textContent = "Ouverture du livre…";
+  position.value = "0";
+  prec.disabled = true;
+  suiv.disabled = true;
+
+  try {
+    const fichiers = await ouvrirZIP(await fichier.arrayBuffer());
+
+    function obtenirTexte(chemin) {
+      const contenu = fichiers.get(normaliser(chemin));
+      if (!contenu) throw new Error(`Fichier absent de l’EPUB : ${chemin}`);
+      return texteXML(contenu);
+    }
+
+    const conteneur = parserXML(obtenirTexte("META-INF/container.xml"));
+    const racine = conteneur.getElementsByTagNameNS("*", "rootfile")[0];
+
+    if (!racine) {
+      throw new Error("Fichier container.xml introuvable ou invalide.");
+    }
+
+    const opfPath = normaliser(racine.getAttribute("full-path"));
+    const opf = parserXML(obtenirTexte(opfPath));
+    const baseOPF = opfPath.includes("/")
+      ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1)
+      : "";
+
+    const titreMeta = opf.getElementsByTagNameNS("*", "title")[0]
+      ?.textContent?.trim();
+
+    if (titreMeta) titre.textContent = titreMeta;
+
+    const manifeste = new Map();
+
+    Array.from(opf.getElementsByTagNameNS("*", "item")).forEach(item => {
+      manifeste.set(item.getAttribute("id"), {
+        path: normaliser(resoudre(item.getAttribute("href"), opfPath)),
+        type: item.getAttribute("media-type")
+      });
+    });
+
+    const chapitres = [];
+
+    Array.from(opf.getElementsByTagNameNS("*", "itemref")).forEach(itemref => {
+      const item = manifeste.get(itemref.getAttribute("idref"));
+
+      if (
+        item &&
+        itemref.getAttribute("linear") !== "no" &&
+        /xhtml|html/i.test(item.type || item.path)
+      ) {
+        chapitres.push(item.path);
+      }
+    });
+
+    if (!chapitres.length) {
+      throw new Error("Aucun chapitre HTML trouvé dans l’ordre de lecture.");
+    }
+
+    const urls = new Map();
+
+    fichiers.forEach((contenu, chemin) => {
+      const url = URL.createObjectURL(
+        new Blob([contenu], { type: mime(chemin) })
+      );
+      urls.set(chemin, url);
+      anciennesURLs.push(url);
+    });
+
+    /* Réécrit aussi les chemins d’images et de polices utilisés par les CSS. */
+    fichiers.forEach((contenu, chemin) => {
+      if (/\.css$/i.test(chemin)) {
+        const css = adapterCSS(texteXML(contenu), chemin, urls);
+        const url = URL.createObjectURL(
+          new Blob([css], { type: "text/css" })
+        );
+        urls.set(chemin, url);
+        anciennesURLs.push(url);
+      }
+    });
+
+    const cheminsChapitres = new Map(
+      chapitres.map((chemin, index) => [chemin, `chapitre-${index + 1}`])
+    );
+
+    const feuillesStyle = [];
+    const contenus = [];
+
+    for (let i = 0; i < chapitres.length; i++) {
+      const chemin = chapitres[i];
+      const doc = new DOMParser().parseFromString(
+        obtenirTexte(chemin),
+        "application/xhtml+xml"
+      );
+
+      if (doc.querySelector("parsererror")) {
+        throw new Error(`Le chapitre ne peut pas être lu : ${chemin}`);
+      }
+
+      Array.from(doc.querySelectorAll('link[rel~="stylesheet"]'))
+        .forEach(link => {
+          const adresse = urlRessource(
+            link.getAttribute("href") || "",
+            chemin,
+            urls
+          );
+
+          if (adresse) {
+            feuillesStyle.push(
+              `<link rel="stylesheet" href="${adresse}">`
+            );
+          }
+        });
+
+      Array.from(doc.querySelectorAll("style")).forEach(style => {
+        const css = adapterCSS(style.textContent, chemin, urls)
+          .replace(/<\/style/gi, "<\\/style");
+
+        feuillesStyle.push(`<style>${css}</style>`);
+      });
+
+      adapterDocument(doc, chemin, urls, cheminsChapitres);
+
+      const corps =
+        doc.getElementsByTagNameNS("*", "body")[0] ||
+        doc.documentElement;
+
+      contenus.push(
+        `<section id="chapitre-${i + 1}" class="chapitre">${corps.innerHTML}</section>`
+      );
+    }
+
+    const styleLecteur = `
+      html { scroll-behavior: auto; }
+      body {
+        margin: 0 auto;
+        padding: 2rem 1.4rem 6rem;
+        max-width: 48rem;
+        color: #24211d;
+        background: #fffdf8;
+        font: 100%/1.7 Georgia, serif;
+      }
+      img, svg, video { max-width: 100%; height: auto; }
+      .chapitre { margin-bottom: 3rem; }
+      .chapitre + .chapitre {
+        border-top: 1px solid #ddd;
+        padding-top: 2rem;
+      }
+      a { color: #315d86; }
+    `;
+
+    const html = `<!doctype html>
+      <html lang="fr">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        ${feuillesStyle.join("\n")}
+        <style>${styleLecteur}</style>
+      </head>
+      <body>${contenus.join("\n")}</body>
+      </html>`;
+
+    frame.onload = () => {
+      const fenetreLivre = frame.contentWindow;
+      const docLivre = frame.contentDocument;
+
+      fenetreLivre.addEventListener(
+        "scroll",
+        actualiserProgression,
+        { passive: true }
+      );
+
+      taille.value = "100";
+      prec.disabled = false;
+      suiv.disabled = false;
+
+      setTimeout(actualiserProgression, 100);
+    };
+
+    frame.srcdoc = html;
+    etat.textContent = "Livre chargé";
+  } catch (erreur) {
+    console.error(erreur);
+    etat.textContent = erreur.message || "Impossible d’ouvrir cet EPUB.";
+  }
+});
+
+function defiler(sens) {
+  const doc = frame.contentDocument;
+  if (!doc || !doc.scrollingElement) return;
+
+  doc.scrollingElement.scrollBy({
+    top: sens * frame.clientHeight * 0.85,
+    behavior: "smooth"
+  });
+}
+
+prec.addEventListener("click", () => defiler(-1));
+suiv.addEventListener("click", () => defiler(1));
+
+position.addEventListener("input", () => {
+  const doc = frame.contentDocument;
+  if (!doc || !doc.scrollingElement) return;
+
+  const defilable = doc.scrollingElement;
+  const maxDefilement = Math.max(
+    0,
+    defilable.scrollHeight - frame.clientHeight
+  );
+
+  defilable.scrollTop = maxDefilement * (Number(position.value) / 10000);
+  actualiserProgression();
+});
+
+taille.addEventListener("input", () => {
+  try {
+    frame.contentDocument.body.style.fontSize = `${taille.value}%`;
+    setTimeout(actualiserProgression, 100);
+  } catch {}
+});
+
+window.addEventListener("resize", actualiserProgression);
+</script>
+</body>
+</html>
